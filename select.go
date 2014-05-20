@@ -2,30 +2,12 @@ package unhtml
 
 import (
 	"code.google.com/p/go.net/html"
+	"code.google.com/p/go.net/html/atom"
 	"strconv"
 	"strings"
 )
 
-type SelectorElem struct {
-	Tag, Id, Cls string
-	index        int
-}
-
-func (selem SelectorElem) String() string {
-	sid, scls, sindex := selem.Id, selem.Cls, ""
-	if sid != "" {
-		sid = "#" + sid
-	}
-	if scls != "" {
-		scls = "." + scls
-	}
-	if selem.index != -1 {
-		sindex = "[" + strconv.Itoa(selem.index) + "]"
-	}
-	return selem.Tag + scls + sid + sindex
-}
-
-type Selector []SelectorElem
+type Selector []selectorElem
 
 func (sel Selector) String() string {
 	ret, sep := "", ""
@@ -35,43 +17,86 @@ func (sel Selector) String() string {
 	return ret
 }
 
-func nodeSelFromString(s string) (sel Selector) {
+func SelectorFromString(s string) (Selector, error) {
 	i := 0
+	var sel Selector
 	for i < len(s) {
 		j := i + ridx(s[i:], '/')
-		var tag string
-		tag, i = s[i:j], j+1
+		var part string
+		part, i = s[i:j], j+1
 
-		elem := SelectorElem{index: -1}
-		for {
-			ei := strings.LastIndexAny(tag, ".#[")
-			if ei == -1 {
-				break
-			}
-			switch tag[ei] {
-			case '[':
-				r := tag[ei+1:]
-				if len(r) < 2 || r[len(r)-1] != ']' {
-					panic(NewErr("InvalidSelIndex", s))
-				}
-				var err error
-				if elem.index, err = strconv.Atoi(r[:len(r)-1]); err != nil {
-					panic(NewErr("InvalidSelIndex", s))
-				}
-			case '#':
-				elem.Id = tag[ei+1:]
-			case '.':
-				elem.Cls = tag[ei+1:]
-			}
-			tag = tag[:ei]
+		elem, err := selectorElemFromString(s)
+		if err != nil {
+			return nil, err
 		}
-		elem.Tag = strings.ToLower(tag)
 		sel = append(sel, elem)
 	}
-	return
+	return sel, nil
 }
 
-func matchNode(node *html.Node, selem SelectorElem) bool {
+type matchNodeContext struct {
+	tagMatchIdx int
+}
+
+type selectorElem interface {
+	matchNode(node *html.Node, ctx *matchNodeContext) bool
+	String() string
+}
+
+func selectorElemFromString(s string) (selectorElem, error) {
+	if s == '*' {
+		return new(matchAllSelectorElem), nil
+	}
+	return newTagSelectorElemFromString(se)
+}
+
+type matchAllSelectorElem struct{}
+
+func (selem *matchAllSelectorElem) matchNode(node *html.Node, ctx *matchNodeContext) bool {
+	return true
+}
+
+func (selem *matchAllSelectorElem) String() string {
+	return "*"
+}
+
+type TagSelectorElem struct {
+	Tag, Id, Cls string
+	Index        int
+}
+
+func newTagSelectorElemFromString(se string) (selectorElem, error) {
+	elem := &TagSelectorElem{index: -1}
+	for {
+		i := strings.LastIndexAny(se, ".#[")
+		if i == -1 {
+			break
+		}
+		switch se[i] {
+		case '[':
+			r := se[i+1:]
+			if len(r) < 2 || r[len(r)-1] != ']' {
+				return nil, NewErr("InvalidSelIndex", s)
+			}
+			var err error
+			if elem.Index, err = strconv.Atoi(r[:len(r)-1]); err != nil {
+				return nil, NewErr("InvalidSelIndex", s)
+			}
+		case '#':
+			elem.Id = se[i+1:]
+		case '.':
+			elem.Cls = se[i+1:]
+		}
+		se = se[:i]
+	}
+	elem.Tag = strings.ToLower(se)
+	if atom.Lookup(elem.Tag) == nil {
+		return nil, NewErr("InvalidSelTag", se)
+	}
+	return elem
+}
+
+func (selem *TagSelectorElem) matchNode(node *html.Node, ctx *matchNodeContext) bool {
 	switch node.Type {
 	case html.DocumentNode, html.ElementNode:
 		if strings.ToLower(node.Data) == selem.Tag {
@@ -84,12 +109,34 @@ func matchNode(node *html.Node, selem SelectorElem) bool {
 					cls = a.Val
 				}
 			}
-			return (selem.Id == "" || selem.Id == id) &&
+			match := (selem.Id == "" || selem.Id == id) &&
 				(selem.Cls == "" || selem.Cls == cls)
+			if match {
+				ret := selem.Index == -1 || selem.Index == ctx.tagMatchIdx
+				ctx.tagMatchIdx++
+				return ret
+			}
 		}
 	}
 	return false
 }
+
+func (selem *TagSelectorElem) String() string {
+	sid, scls, sindex := selem.Id, selem.Cls, ""
+	if sid != "" {
+		sid = "#" + sid
+	}
+	if scls != "" {
+		scls = "." + scls
+	}
+	if selem.Index != -1 {
+		sindex = "[" + strconv.Itoa(selem.Index) + "]"
+	}
+	return selem.Tag + scls + sid + sindex
+}
+
+//func selectNodesImpl2(node *html.Node, sel Selector, chquit <-chan bool, chmatch chan<- *html.Node) {
+//}
 
 func selectNodesImpl(node *html.Node, sel Selector, chquit <-chan bool, chmatch chan<- *html.Node) {
 	if len(sel) == 0 {
@@ -100,13 +147,10 @@ func selectNodesImpl(node *html.Node, sel Selector, chquit <-chan bool, chmatch 
 		return
 	}
 	selem, rest := sel[0], sel[1:]
-	idx := 0
+	mnc := &matchNodeContext{}
 	for c := node.FirstChild; c != nil; c = c.NextSibling {
-		if matchNode(c, selem) {
-			if selem.index == -1 || selem.index == idx {
-				selectNodesImpl(c, rest, chquit, chmatch)
-			}
-			idx++
+		if selem.matchNode(mnc, c) {
+			selectNodesImpl(c, rest, chquit, chmatch)
 		}
 	}
 }
