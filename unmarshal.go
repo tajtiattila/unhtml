@@ -1,7 +1,6 @@
 package unhtml
 
 import (
-	"bytes"
 	"code.google.com/p/go.net/html"
 	"fmt"
 	"io"
@@ -18,7 +17,8 @@ type DecodeFunc func(data string) (interface{}, error)
 
 // Context is used for HTML unmarshaling.
 type Context struct {
-	Funcs map[string]DecodeFunc
+	BaseUrl string
+	Funcs   map[string]DecodeFunc
 }
 
 func NewContext() *Context {
@@ -66,7 +66,9 @@ func (ctx *Context) unmarshal(node *html.Node, v reflect.Value, t unhtmlTag) {
 		})
 	case t.innerHtml:
 		unmarshalSpec(node, v, t.sel, func(n *html.Node) reflect.Value {
-			return reflect.ValueOf(innerHtml(n))
+			x := cloneNode(n)
+			absUrl(x, ctx.BaseUrl)
+			return reflect.ValueOf(innerHtml(x))
 		})
 	default:
 		switch v.Kind() {
@@ -90,20 +92,41 @@ func (ctx *Context) unmarshal(node *html.Node, v reflect.Value, t unhtmlTag) {
 			unmarshalFunc(node, t.sel, func(s string) {
 				v.SetString(s)
 			})
+		case reflect.Ptr:
+			if v.IsNil() {
+				fmt.Println(v)
+				v.Set(reflect.New(v.Type().Elem()))
+			}
+			ctx.unmarshal(node, v.Elem(), t)
 		case reflect.Slice:
 			v.SetLen(0)
-			chq := make(chan bool)
-			ve := reflect.New(v.Type().Elem()).Elem()
-			for cnode := range selectNodes(node, t.sel, chq) {
+			s := Select(node, t.sel)
+			defer s.Close()
+			var fv func() reflect.Value
+			et := v.Type().Elem()
+			switch et.Kind() {
+			case reflect.Ptr:
+				fv = func() reflect.Value {
+					return reflect.New(et.Elem())
+				}
+			default:
+				ve := reflect.New(et).Elem()
+				fv = func() reflect.Value {
+					return ve
+				}
+			}
+			for cnode := range s.Matches() {
+				ve := fv()
 				ctx.unmarshal(cnode, ve, t)
 				v.Set(reflect.Append(v, ve))
 			}
-			close(chq)
 		case reflect.Struct:
 			for i := 0; i < v.NumField(); i++ {
 				vi, sf := v.Field(i), v.Type().Field(i)
 				sft := decodeTag(sf.Tag)
-				ctx.unmarshal(node, vi, sft)
+				if sft.sel != nil {
+					ctx.unmarshal(node, vi, sft)
+				}
 			}
 		}
 	}
@@ -126,18 +149,8 @@ func nodeAsString(node *html.Node) (s string) {
 	return strings.TrimSpace(nodeAsStringRec(node))
 }
 
-func innerHtml(node *html.Node) string {
-	buf := &bytes.Buffer{}
-	for c := node.FirstChild; c != nil; c = c.NextSibling {
-		if err := html.Render(buf, c); err != nil {
-			panic(err)
-		}
-	}
-	return strings.TrimSpace(buf.String())
-}
-
 func unmarshalFunc(node *html.Node, sel Selector, f func(s string)) {
-	cnode := selectNode(node, sel)
+	cnode := SelectFirst(node, sel)
 	if cnode == nil {
 		return
 	}
@@ -148,28 +161,26 @@ func unmarshalSpec(node *html.Node, v reflect.Value, sel Selector,
 	f func(node *html.Node) reflect.Value) {
 	switch v.Kind() {
 	case reflect.Array:
-		chq := make(chan bool)
-		i := 0
-		for cnode := range selectNodes(node, sel, chq) {
-			if i < v.Len() {
-				v.Index(i).Set(f(cnode))
-				i++
-			} else {
-				close(chq)
+		s := Select(node, sel)
+		defer s.Close()
+		for i := 0; i < v.Len(); i++ {
+			cnode := s.Match()
+			if cnode == nil {
 				break
 			}
+			v.Index(i).Set(f(cnode))
 		}
 	case reflect.Slice:
 		v.SetLen(0)
-		chq := make(chan bool)
-		for cnode := range selectNodes(node, sel, chq) {
+		s := Select(node, sel)
+		defer s.Close()
+		for cnode := range s.Matches() {
 			v = reflect.Append(v, f(cnode))
 		}
-		close(chq)
 	default:
-		node = selectNode(node, sel)
+		node = SelectFirst(node, sel)
 		if node != nil {
-			v.Set(f(node))
+			v.Set(f(node).Convert(v.Type()))
 		}
 	}
 }
@@ -206,7 +217,11 @@ func decodeTag(st reflect.StructTag) unhtmlTag {
 
 func decodeTagString(value string) unhtmlTag {
 	i := ridx(value, ',')
-	t := unhtmlTag{sel: nodeSelFromString(value[:i])}
+	sel, err := SelectorFromString(value[:i])
+	if err != nil {
+		panic(err)
+	}
+	t := unhtmlTag{sel: sel}
 	i++
 	for i < len(value) {
 		j := i + ridx(value[i:], ',')

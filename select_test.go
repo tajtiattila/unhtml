@@ -6,6 +6,12 @@ import (
 	"testing"
 )
 
+func TestSelectorFromString(t *testing.T) {
+	SelectorFromString("html/body/div.container/div.contentbox")
+	SelectorFromString("table.commentheader/tbody/tr.commentheader/td[0]/a.commentmem")
+	SelectorFromString("table.commentheader/tbody/tr.commentheader/td[3]/a.contlinks")
+}
+
 func TestDecodeTag(t *testing.T) {
 	decodeTag("html/body/div.container/div.contentbox")
 	decodeTag("table.commentheader/tbody/tr.commentheader/td[0]/a.commentmem")
@@ -55,7 +61,7 @@ func TestSelectNode(t *testing.T) {
 
 	for _, ts := range vts {
 		tag := decodeTagString(ts)
-		n := selectNode(doc, tag.sel)
+		n := SelectFirst(doc, tag.sel)
 		if n == nil || n == doc {
 			t.Error(ts, tag.String(), "yields", n)
 		}

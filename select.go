@@ -7,8 +7,55 @@ import (
 	"strings"
 )
 
+// Selector is something like XPath for HTML
 type Selector []selectorElem
 
+// SelectorFromString creates a Selector from s. The string
+// is made up from path parts separated by '/'.
+//
+// Possible path elements:
+// * (asterisk)       select all direct children
+// // (double slash)  select children recursively
+// tag                matches HTML nodes "tag"
+// .class             matches HTML nodes with specified class
+// #id                matches HTML nodes with specified id
+// [index]            matches HTML nodes with given index
+//
+// tag, #id, .class and [index] may be combined.
+//
+// Examples:
+// */table.comment/tbody/tr/td[0]
+//    matches the first table cell of all rows in tables with class "comment"
+func SelectorFromString(s string) (Selector, error) {
+	i := 0
+	var sel Selector
+	rec := false
+	for i < len(s) {
+		j := i + ridx(s[i:], '/')
+		var part string
+		part, i = s[i:j], j+1
+
+		if part == "" {
+			rec = true
+			continue
+		}
+		elem, err := selectorElemFromString(part)
+		if err != nil {
+			return nil, err
+		}
+		if rec {
+			elem = &recursiveSelectorElem{base: elem}
+			rec = false
+		}
+		sel = append(sel, elem)
+	}
+	if rec {
+		return nil, NewErr("TrailingSlash", s)
+	}
+	return sel, nil
+}
+
+// Get canonical representation of sel.
 func (sel Selector) String() string {
 	ret, sep := "", ""
 	for _, selem := range sel {
@@ -17,64 +64,66 @@ func (sel Selector) String() string {
 	return ret
 }
 
-func SelectorFromString(s string) (Selector, error) {
-	i := 0
-	var sel Selector
-	for i < len(s) {
-		j := i + ridx(s[i:], '/')
-		var part string
-		part, i = s[i:j], j+1
-
-		elem, err := selectorElemFromString(s)
-		if err != nil {
-			return nil, err
-		}
-		sel = append(sel, elem)
-	}
-	return sel, nil
-}
+////////////////////////////////////////////////////////////////////////////////
 
 type matchNodeContext struct {
 	tagMatchIdx int
 }
 
 type selectorElem interface {
-	matchNode(node *html.Node, ctx *matchNodeContext) bool
+	matchNode(node *html.Node, ctx *matchNodeContext) (exact bool, rec bool)
 	String() string
 }
 
 func selectorElemFromString(s string) (selectorElem, error) {
-	if s == '*' {
+	if s == "*" {
 		return new(matchAllSelectorElem), nil
 	}
-	return newTagSelectorElemFromString(se)
+	return newTagSelectorElemFromString(s)
 }
 
+// matchAllSelectorElem matches base and searches all children
+type recursiveSelectorElem struct {
+	base selectorElem
+}
+
+func (selem *recursiveSelectorElem) String() string {
+	return "/" + selem.base.String()
+}
+
+func (selem *recursiveSelectorElem) matchNode(node *html.Node, ctx *matchNodeContext) (bool, bool) {
+	exact, _ := selem.base.matchNode(node, ctx)
+	return exact, true
+}
+
+// matchAllSelectorElem selects all direct children
 type matchAllSelectorElem struct{}
 
-func (selem *matchAllSelectorElem) matchNode(node *html.Node, ctx *matchNodeContext) bool {
-	return true
+func (selem *matchAllSelectorElem) matchNode(node *html.Node, ctx *matchNodeContext) (bool, bool) {
+	return true, false
 }
 
 func (selem *matchAllSelectorElem) String() string {
 	return "*"
 }
 
-type TagSelectorElem struct {
-	Tag, Id, Cls string
-	Index        int
+// tagSelectorElem selects direct children according to tag/id/cls/index spec
+type tagSelectorElem struct {
+	Atom    atom.Atom
+	Id, Cls string
+	Index   int
 }
 
-func newTagSelectorElemFromString(se string) (selectorElem, error) {
-	elem := &TagSelectorElem{index: -1}
+func newTagSelectorElemFromString(s string) (selectorElem, error) {
+	elem := &tagSelectorElem{Index: -1}
 	for {
-		i := strings.LastIndexAny(se, ".#[")
+		i := strings.LastIndexAny(s, ".#[")
 		if i == -1 {
 			break
 		}
-		switch se[i] {
+		switch s[i] {
 		case '[':
-			r := se[i+1:]
+			r := s[i+1:]
 			if len(r) < 2 || r[len(r)-1] != ']' {
 				return nil, NewErr("InvalidSelIndex", s)
 			}
@@ -83,23 +132,23 @@ func newTagSelectorElemFromString(se string) (selectorElem, error) {
 				return nil, NewErr("InvalidSelIndex", s)
 			}
 		case '#':
-			elem.Id = se[i+1:]
+			elem.Id = s[i+1:]
 		case '.':
-			elem.Cls = se[i+1:]
+			elem.Cls = s[i+1:]
 		}
-		se = se[:i]
+		s = s[:i]
 	}
-	elem.Tag = strings.ToLower(se)
-	if atom.Lookup(elem.Tag) == nil {
-		return nil, NewErr("InvalidSelTag", se)
+	elem.Atom = atom.Lookup([]byte(strings.ToLower(s)))
+	if s != "" && elem.Atom == 0 {
+		return nil, NewErr("InvalidSelTag", s)
 	}
-	return elem
+	return elem, nil
 }
 
-func (selem *TagSelectorElem) matchNode(node *html.Node, ctx *matchNodeContext) bool {
+func (selem *tagSelectorElem) matchNode(node *html.Node, ctx *matchNodeContext) (exact bool, rec bool) {
 	switch node.Type {
 	case html.DocumentNode, html.ElementNode:
-		if strings.ToLower(node.Data) == selem.Tag {
+		if selem.Atom == 0 || node.DataAtom == selem.Atom {
 			var id, cls string
 			for _, a := range node.Attr {
 				switch a.Key {
@@ -112,16 +161,15 @@ func (selem *TagSelectorElem) matchNode(node *html.Node, ctx *matchNodeContext) 
 			match := (selem.Id == "" || selem.Id == id) &&
 				(selem.Cls == "" || selem.Cls == cls)
 			if match {
-				ret := selem.Index == -1 || selem.Index == ctx.tagMatchIdx
+				exact = selem.Index == -1 || selem.Index == ctx.tagMatchIdx
 				ctx.tagMatchIdx++
-				return ret
 			}
 		}
 	}
-	return false
+	return
 }
 
-func (selem *TagSelectorElem) String() string {
+func (selem *tagSelectorElem) String() string {
 	sid, scls, sindex := selem.Id, selem.Cls, ""
 	if sid != "" {
 		sid = "#" + sid
@@ -132,47 +180,5 @@ func (selem *TagSelectorElem) String() string {
 	if selem.Index != -1 {
 		sindex = "[" + strconv.Itoa(selem.Index) + "]"
 	}
-	return selem.Tag + scls + sid + sindex
-}
-
-//func selectNodesImpl2(node *html.Node, sel Selector, chquit <-chan bool, chmatch chan<- *html.Node) {
-//}
-
-func selectNodesImpl(node *html.Node, sel Selector, chquit <-chan bool, chmatch chan<- *html.Node) {
-	if len(sel) == 0 {
-		select {
-		case <-chquit:
-		case chmatch <- node:
-		}
-		return
-	}
-	selem, rest := sel[0], sel[1:]
-	mnc := &matchNodeContext{}
-	for c := node.FirstChild; c != nil; c = c.NextSibling {
-		if selem.matchNode(mnc, c) {
-			selectNodesImpl(c, rest, chquit, chmatch)
-		}
-	}
-}
-
-func selectNodes(node *html.Node, sel Selector, chquit <-chan bool) <-chan *html.Node {
-	ch := make(chan *html.Node)
-	go func() {
-		selectNodesImpl(node, sel, chquit, ch)
-		close(ch)
-	}()
-	return ch
-}
-
-func selectNode(node *html.Node, sel Selector) *html.Node {
-	if len(sel) == 0 {
-		return node
-	}
-	chq := make(chan bool)
-	found, ok := <-selectNodes(node, sel, chq)
-	close(chq)
-	if ok {
-		return found
-	}
-	return nil
+	return selem.Atom.String() + scls + sid + sindex
 }
